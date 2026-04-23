@@ -18,28 +18,9 @@ envoy-sidecar-poc/
 ├── k8s/
 │   ├── schema-registry-with-sidecar.yaml              # full K8s manifest (Deployment+Service+CM)
 │   └── network-policy.yaml                            # bypass prevention
-├── integration/
-│   ├── DOCKERFILE-VS-DEPLOYMENT.md                    # WHERE changes go (key doc)
-│   ├── ENVOY-IMAGE-MIRROR-TICKET.md                   # ticket template for platform team
-│   └── PR-DESCRIPTION.md                              # ready-to-paste PR body
-├── docs/
-│   └── ADR-002-envoy-sidecar-block-delete.md          # proposal doc
 ├── LICENSE
 └── .gitignore
 ```
-
----
-
-## The 3 documents that matter most
-
-| Doc | Read when |
-|---|---|
-| **`docs/ADR-002-envoy-sidecar-block-delete.md`** | Before presenting to platform lead |
-| **`integration/DOCKERFILE-VS-DEPLOYMENT.md`** | When you're ready to make the PR |
-| **`integration/PR-DESCRIPTION.md`** | Copy-paste into the PR |
-
-The K8s manifests and Envoy config are the artefacts you'll actually deploy,
-but the three docs above are what get you there socially.
 
 ---
 
@@ -54,6 +35,42 @@ bash scripts/verify.sh
 Expected: 6 green PASS lines. If you see all green, the RBAC filter is
 behaving correctly — you have a working artefact to demo.
 
+## Proof of DELETE Blocking
+
+Running the verification script produces the following output, confirming DELETE requests are blocked:
+
+```
+== Target: http://localhost:8080  |  Subject: envoy-poc-1776944867 ==
+
+== Test 1: GET /subjects → expect 200 ==
+  PASS GET 200
+
+== Test 2: POST schema → expect 200 ==
+  PASS POST 200, body: {"id":2}
+
+== Test 3: DELETE subject → expect 403 + x-delete-blocked header ==
+    status: 403, header: x-delete-blocked: envoy-sidecar-rbac
+    body:   {"blocked_by":"envoy-sidecar-rbac","error_code":40300,"message":"DELETE blocked by Envoy sidecar RBAC policy"}
+  PASS DELETE blocked (403 + proof header present)
+
+== Test 4: DELETE version → expect 403 ==
+  PASS DELETE version 403
+
+== Test 5: Subject still exists (DELETE didn't leak through) → expect 200 ==
+  PASS GET versions 200: [1]
+
+== Test 6: Envoy RBAC metrics (admin :9901) ==
+    rbac.allowed=3  rbac.denied=2
+  PASS rbac.denied=2 (>=2 expected)
+
+== Summary: 6 passed, 0 failed ==
+```
+
+This demonstrates that:
+- DELETE requests return 403 Forbidden with a custom `x-delete-blocked` header.
+- The subject persists after attempted deletion.
+- Envoy metrics show 2 denied requests (the DELETE attempts).
+
 ```bash
 # When you're done:
 docker compose down -v
@@ -63,18 +80,13 @@ docker compose down -v
 
 ## The mission in 4 bullets
 
-1. **Envoy image mirror:** file ticket (`integration/ENVOY-IMAGE-MIRROR-TICKET.md`)
-   → platform team mirrors `envoyproxy/envoy:v1.31-latest` to
-   `hub.docker.internal.cba/envoyproxy/envoy:...`.
+1. **Envoy image mirror:** file ticket for platform team to mirror `envoyproxy/envoy:v1.31-latest` to `hub.docker.internal.cba/envoyproxy/envoy:...`.
 
-2. **ADR review:** share `docs/ADR-002-envoy-sidecar-block-delete.md` with
-   platform lead + security + networking. Answer Section 12 open questions.
+2. **ADR review:** share ADR with platform lead + security + networking. Answer open questions.
 
-3. **PR in GitOps repo:** use `integration/DOCKERFILE-VS-DEPLOYMENT.md` to
-   see exactly which YAML files to change, and `integration/PR-DESCRIPTION.md`
-   as the PR body.
+3. **PR in GitOps repo:** modify deployment.yaml to add sidecar container.
 
-4. **Dev soak → prod rollout:** follow the phased plan in ADR-002 Section 6.
+4. **Dev soak → prod rollout:** follow phased plan.
 
 ---
 
