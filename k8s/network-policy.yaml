@@ -1,0 +1,33 @@
+# ============================================================================
+# Hardens the sidecar approach: even though SR listens on 127.0.0.1, a rogue
+# pod could still try to hit the pod's IP on port 8081. This NetworkPolicy
+# says: "nothing except Envoy (same pod) can reach SR port 8081 anywhere."
+#
+# NOTE: in practice, since SR binds 127.0.0.1 only, this NetworkPolicy is
+# belt-and-suspenders. But it's the documented safe default.
+#
+# REQUIRES: a NetworkPolicy controller in the cluster (EKS needs Calico,
+# Cilium, or VPC CNI with policies enabled — check with platform team).
+# ============================================================================
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: schema-registry-ingress
+  namespace: schema-registry
+spec:
+  podSelector:
+    matchLabels: { app: schema-registry }
+  policyTypes: [Ingress]
+  ingress:
+    # Port 8081 (SR) — only localhost + same-pod can reach it.
+    # Since Envoy is the ONLY thing in the pod alongside SR, this effectively
+    # limits SR access to Envoy.
+    - ports:
+        - { protocol: TCP, port: 8081 }
+      from:
+        - podSelector:
+            matchLabels: { app: schema-registry }
+    # Port 8080 (Envoy) — allow from anywhere inside the cluster. Clients
+    # enter here and are subject to the RBAC filter.
+    - ports:
+        - { protocol: TCP, port: 8080 }

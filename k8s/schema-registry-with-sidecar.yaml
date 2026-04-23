@@ -1,0 +1,160 @@
+# ============================================================================
+# Schema Registry Deployment with Envoy sidecar blocking DELETE.
+#
+# Key changes vs. vanilla SR deployment:
+#   1. SCHEMA_REGISTRY_LISTENERS is localhost-only (127.0.0.1:8081) — SR no
+#      longer listens on the pod network. This forces all traffic through Envoy.
+#   2. A second container `envoy` is added to the same pod.
+#   3. An envoy-config ConfigMap is mounted into the envoy container.
+#   4. The Service targets the envoy container (port 8080), not SR directly.
+#   5. Readiness/liveness probes target Envoy's admin (:9901/ready), NOT SR,
+#      because the Service contract = "ready when Envoy is ready."
+#
+# This file is a REFERENCE — your real Deployment in cba-schema-registry repo
+# already has CBA-specific env vars, probes, resources, etc. See ADR for
+# which lines to add/modify.
+# ============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: sr-envoy-sidecar-config
+  namespace: schema-registry
+data:
+  envoy.yaml: |
+    admin:
+      address:
+        socket_address: { address: 127.0.0.1, port_value: 9901 }
+    static_resources:
+      listeners:
+        - name: ingress
+          address:
+            socket_address: { address: 0.0.0.0, port_value: 8080 }
+          filter_chains:
+            - filters:
+                - name: envoy.filters.network.http_connection_manager
+                  typed_config:
+                    "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                    stat_prefix: ingress_http
+                    access_log:
+                      - name: envoy.access_loggers.stdout
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                    local_reply_config:
+                      mappers:
+                        - filter:
+                            status_code_filter:
+                              comparison:
+                                op: EQ
+                                value: { default_value: 403, runtime_key: "rbac_deny_status" }
+                          headers_to_add:
+                            - header: { key: "x-delete-blocked", value: "envoy-sidecar-rbac" }
+                              append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                          body_format_override:
+                            json_format:
+                              error_code: 40300
+                              message: "DELETE blocked by Envoy sidecar RBAC policy"
+                              blocked_by: "envoy-sidecar-rbac"
+                    route_config:
+                      virtual_hosts:
+                        - name: schema_registry
+                          domains: ["*"]
+                          routes:
+                            - match: { prefix: "/" }
+                              route: { cluster: schema_registry_local }
+                    http_filters:
+                      - name: envoy.filters.http.rbac
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                          rules:
+                            action: DENY
+                            policies:
+                              "block-delete":
+                                permissions:
+                                  - header: { name: ":method", string_match: { exact: "DELETE" } }
+                                principals: [{ any: true }]
+                      - name: envoy.filters.http.router
+                        typed_config:
+                          "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      clusters:
+        - name: schema_registry_local
+          type: STATIC
+          connect_timeout: 2s
+          load_assignment:
+            cluster_name: schema_registry_local
+            endpoints:
+              - lb_endpoints:
+                  - endpoint:
+                      address:
+                        socket_address: { address: 127.0.0.1, port_value: 8081 }
+---
+# SR Service now targets port 8080 (Envoy) instead of 8081 (SR).
+# Clients hitting `http://schema-registry:8081` go to Envoy first.
+apiVersion: v1
+kind: Service
+metadata:
+  name: schema-registry
+  namespace: schema-registry
+spec:
+  selector: { app: schema-registry }
+  ports:
+    # External "8081" convention preserved for clients, but routed to Envoy.
+    - { name: http, port: 8081, targetPort: 8080 }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: schema-registry
+  namespace: schema-registry
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: schema-registry } }
+  template:
+    metadata:
+      labels: { app: schema-registry }
+    spec:
+      containers:
+        # ─────────── SR container (unchanged except for LISTENERS) ───────────
+        - name: schema-registry
+          image: hub.docker.internal.cba/confluent/cp-schema-registry:7.6.1
+          env:
+            # CRITICAL: bind to localhost ONLY so external traffic cannot
+            # reach SR directly — must go through Envoy.
+            - { name: SCHEMA_REGISTRY_LISTENERS, value: "http://127.0.0.1:8081" }
+            - { name: SCHEMA_REGISTRY_HOST_NAME, value: "127.0.0.1" }
+            - { name: SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS, value: "SASL_SSL://b-1.msk.cba:9098" }
+            # ... CBA's other env vars stay unchanged
+          # Probes hit SR directly (localhost) — these are INSIDE the pod.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "curl -fsS http://127.0.0.1:8081/subjects >/dev/null"]
+            initialDelaySeconds: 25
+            periodSeconds: 10
+          resources:
+            requests: { cpu: 500m, memory: 1Gi }
+            limits:   { cpu: 2,    memory: 2Gi }
+
+        # ─────────── Envoy sidecar (NEW) ───────────
+        - name: envoy
+          image: hub.docker.internal.cba/envoyproxy/envoy:v1.31-latest
+          args: ["-c", "/etc/envoy/envoy.yaml", "--log-level", "info"]
+          ports:
+            - { name: http,  containerPort: 8080 }
+            - { name: admin, containerPort: 9901 }
+          volumeMounts:
+            - { name: envoy-config, mountPath: /etc/envoy, readOnly: true }
+          readinessProbe:
+            httpGet: { path: /ready, port: 9901 }
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /ready, port: 9901 }
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          resources:
+            requests: { cpu: 50m,  memory: 64Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+
+      volumes:
+        - name: envoy-config
+          configMap: { name: sr-envoy-sidecar-config }

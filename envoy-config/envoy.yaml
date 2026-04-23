@@ -1,0 +1,90 @@
+# ============================================================================
+# Envoy SIDECAR config for Schema Registry pod.
+#
+# Placement: runs as a container ALONGSIDE schema-registry in the same Pod.
+# They share network namespace → sidecar can reach SR at 127.0.0.1:8081.
+#
+# Traffic flow:
+#   client ──► Service :8081 ──► pod :8080 (envoy) ──► 127.0.0.1:8081 (SR)
+#                                    │
+#                                    └─ RBAC: deny :method == DELETE → 403
+#
+# Why SR doesn't listen on the pod network directly:
+#   SR binds to 127.0.0.1 (localhost-only) so the ONLY way into SR from
+#   outside the pod is through Envoy. This is what makes bypass impossible.
+# ============================================================================
+
+admin:
+  address:
+    socket_address: { address: 127.0.0.1, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 8080 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                # Rewrite 403 (RBAC default) into a JSON body matching
+                # Schema Registry's error shape, and stamp a proof header.
+                local_reply_config:
+                  mappers:
+                    - filter:
+                        status_code_filter:
+                          comparison:
+                            op: EQ
+                            value: { default_value: 403, runtime_key: "rbac_deny_status" }
+                      headers_to_add:
+                        - header: { key: "x-delete-blocked", value: "envoy-sidecar-rbac" }
+                          append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                      body_format_override:
+                        json_format:
+                          error_code: 40300
+                          message: "DELETE blocked by Envoy sidecar RBAC policy"
+                          blocked_by: "envoy-sidecar-rbac"
+                route_config:
+                  virtual_hosts:
+                    - name: schema_registry
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: schema_registry_local }
+                http_filters:
+                  # ---- RBAC: deny requests where :method == DELETE ----
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: DENY
+                        policies:
+                          "block-delete":
+                            permissions:
+                              - header:
+                                  name: ":method"
+                                  string_match: { exact: "DELETE" }
+                            principals:
+                              - any: true
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: schema_registry_local
+      type: STATIC
+      connect_timeout: 2s
+      load_assignment:
+        cluster_name: schema_registry_local
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    # SR is localhost inside the same pod
+                    socket_address: { address: 127.0.0.1, port_value: 8081 }
