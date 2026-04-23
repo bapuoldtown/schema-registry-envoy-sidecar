@@ -90,6 +90,18 @@ docker compose down -v
 
 ---
 
+## Files to Modify for Implementation
+
+To implement the Envoy sidecar approach, update the following files in your GitOps repository:
+
+- **`deployment.yaml`**: Add the Envoy sidecar container to the Schema Registry pod spec. Include init containers for config setup, volume mounts for Envoy config, and update the service port to route through Envoy (8080 → 8081).
+- **`service.yaml`**: Change the target port from 8081 (Schema Registry) to 8080 (Envoy proxy).
+- **New `configmap.yaml`**: Create a ConfigMap with the Envoy configuration (RBAC filter to block DELETE methods).
+
+See `k8s/schema-registry-with-sidecar.yaml` for a complete example of the modified manifests.
+
+---
+
 ## Compared to the JAR approach (ADR-001)
 
 | Aspect | JAR (ADR-001) | Envoy sidecar (ADR-002) |
