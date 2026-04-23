@@ -1,0 +1,120 @@
+# End-to-end CI for the Envoy sidecar POC.
+# Runs docker compose stack, waits for SR, runs 6-test harness, asserts RBAC denied >= 2.
+
+name: Test POC end-to-end
+
+on:
+  push:
+    branches: [main, 'feat-*', 'test-*', 'bump-*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  yaml-syntax:
+    name: YAML syntax check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate all YAML files parse
+        run: |
+          pip install pyyaml
+          fail=0
+          for f in $(find . -name '*.yaml' -o -name '*.yml' | grep -v '.github'); do
+            if python3 -c "import yaml; list(yaml.safe_load_all(open('$f')))" 2>/dev/null; then
+              echo "OK   $f"
+            else
+              echo "FAIL $f"
+              fail=1
+            fi
+          done
+          exit $fail
+
+  envoy-config-validate:
+    name: Envoy config validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate envoy.compose.yaml against Envoy v1.31
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/cfg \
+            envoyproxy/envoy:v1.31-latest \
+            envoy --mode validate -c /cfg/envoy-config/envoy.compose.yaml \
+            --log-level warning
+      - name: Validate envoy.yaml (K8s variant)
+        run: |
+          docker run --rm -v ${{ github.workspace }}:/cfg \
+            envoyproxy/envoy:v1.31-latest \
+            envoy --mode validate -c /cfg/envoy-config/envoy.yaml \
+            --log-level warning
+
+  e2e-docker-compose:
+    name: End-to-end Docker Compose test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show docker / compose versions
+        run: |
+          docker --version
+          docker compose version
+
+      - name: Start the stack
+        run: |
+          docker compose up -d
+          docker compose ps
+
+      - name: Wait for Envoy->SR path to be ready
+        run: |
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:8080/subjects >/dev/null 2>&1; then
+              echo "Ready after $((i*2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Not ready in 90s"
+          docker compose ps
+          docker compose logs --tail 80
+          exit 1
+
+      - name: Run the 6-test verification harness
+        run: bash scripts/verify.sh
+
+      - name: Confirm RBAC denied >= 2
+        run: |
+          stats=$(curl -s http://localhost:9901/stats?filter=rbac)
+          echo "$stats"
+          denied=$(echo "$stats" | grep -oE 'rbac\.denied: [0-9]+' | awk '{print $2}' | head -1)
+          if [ -z "$denied" ] || [ "$denied" -lt 2 ]; then
+            echo "ERROR: expected rbac.denied >= 2, got '$denied'"
+            exit 1
+          fi
+          echo "OK: rbac.denied=$denied"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "======== KAFKA ========" && docker compose logs kafka --tail 60
+          echo "======== SR ========"    && docker compose logs schema-registry --tail 60
+          echo "======== ENVOY ========" && docker compose logs envoy --tail 60
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  k8s-manifest-validation:
+    name: K8s manifest dry-run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.29.3
+      - name: Validate K8s manifests (client-side dry run)
+        run: |
+          for f in k8s/*.yaml; do
+            echo "=== $f ==="
+            kubectl apply --dry-run=client -f "$f" --validate=true
+          done
