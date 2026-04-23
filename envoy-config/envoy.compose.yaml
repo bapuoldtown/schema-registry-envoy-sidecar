@@ -1,0 +1,75 @@
+# Docker Compose variant of envoy.yaml.
+# Identical RBAC filter; only difference is the upstream cluster address
+# (Docker Compose DNS "schema-registry" vs K8s sidecar "127.0.0.1") and
+# the listener port (10000 mapped to 8080 on host, matching existing
+# local POC conventions).
+#
+# Keep this in sync with envoy.yaml (the K8s sidecar version).
+
+admin:
+  address:
+    socket_address: { address: 0.0.0.0, port_value: 9901 }
+
+static_resources:
+  listeners:
+    - name: ingress
+      address:
+        socket_address: { address: 0.0.0.0, port_value: 10000 }
+      filter_chains:
+        - filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: ingress_http
+                access_log:
+                  - name: envoy.access_loggers.stdout
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                local_reply_config:
+                  mappers:
+                    - filter:
+                        status_code_filter:
+                          comparison:
+                            op: EQ
+                            value: { default_value: 403, runtime_key: "rbac_deny_status" }
+                      headers_to_add:
+                        - header: { key: "x-delete-blocked", value: "envoy-sidecar-rbac" }
+                          append_action: OVERWRITE_IF_EXISTS_OR_ADD
+                      body_format_override:
+                        json_format:
+                          error_code: 40300
+                          message: "DELETE blocked by Envoy sidecar RBAC policy"
+                          blocked_by: "envoy-sidecar-rbac"
+                route_config:
+                  virtual_hosts:
+                    - name: schema_registry
+                      domains: ["*"]
+                      routes:
+                        - match: { prefix: "/" }
+                          route: { cluster: schema_registry_upstream }
+                http_filters:
+                  - name: envoy.filters.http.rbac
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.rbac.v3.RBAC
+                      rules:
+                        action: DENY
+                        policies:
+                          "block-delete":
+                            permissions:
+                              - header: { name: ":method", string_match: { exact: "DELETE" } }
+                            principals: [{ any: true }]
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+
+  clusters:
+    - name: schema_registry_upstream
+      type: STRICT_DNS
+      connect_timeout: 2s
+      load_assignment:
+        cluster_name: schema_registry_upstream
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address: { address: schema-registry, port_value: 8081 }
